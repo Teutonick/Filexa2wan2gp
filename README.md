@@ -7,6 +7,8 @@ Bot: https://t.me/WorkOnBigFilesBot
 
 Not affiliated with, endorsed by, or sponsored by Wan2GP.
 
+![Demo](docs/img/demo_pingpong.gif)
+
 ## Layout
 
 - `plugin.py` - Wan2GP plugin implementation.
