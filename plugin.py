@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import html
 import json
 import math
 import mimetypes
@@ -10,6 +11,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -25,8 +27,11 @@ from shared.utils.plugins import WAN2GPPlugin
 
 
 CONNECTOR_NAME = "Filexa2Wan2GP Connector"
-CONNECTOR_VERSION = "0.1.0"
+CONNECTOR_VERSION = "0.8.1"
+CONNECTOR_TAB_LABEL = "Filexa2Wan2GP"
 CONNECTOR_ID = "Filexa2Wan2GPConnector"
+FILEXA_BOT_URL = "https://t.me/WorkOnBigFilesBot"
+PLUGIN_REPO_URL = "https://github.com/Teutonick/Filexa2wan2gp"
 FILEXA_ENGINE = "wangp"
 POLL_DELAY_SECONDS = 10
 MAX_PROMPT_CHARS = 8000
@@ -63,11 +68,16 @@ class FilexaConfig:
     enabled: bool = False
     api_url: str = ""
     token: str = ""
-    debug_logging: bool = False
     keep_result_on_pc_only: bool = False
     compress_images_before_upload: bool = True
+    manual_snapshot_mode: bool = False
     default_settings_json: str = ""
     default_video_settings_json: str = ""
+    last_success_settings_json: str = ""
+    last_success_video_settings_json: str = ""
+    worker_backend: str = ""
+    settings_source: str = ""
+    diagnostics: list[str] = field(default_factory=list)
     status: str = "disabled"
     last_event: str = ""
     last_error: str = ""
@@ -97,6 +107,7 @@ class TaskRuntime:
     temp_dir: Path
     started_at: float
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    reference_paths: list[str] = field(default_factory=list)
 
 
 class FilexaUnauthorizedError(RuntimeError):
@@ -224,8 +235,10 @@ class FilexaClient:
         if 200 <= response.status_code < 300:
             return
         body = _short_text(response.text, 500)
-        if response.status_code == 401:
-            raise FilexaUnauthorizedError("Filexa returned 401 Unauthorized; reconnect with a new token.")
+        if response.status_code in {401, 403}:
+            raise FilexaUnauthorizedError(
+                f"Filexa returned {response.status_code} Unauthorized; reconnect with a new token."
+            )
         raise FilexaHttpError(response.status_code, f"Filexa HTTP {response.status_code}: {body}")
 
 
@@ -272,41 +285,61 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         self.version = CONNECTOR_VERSION
         self.description = "Connects WanGP to Filexa local image/video generation."
         self.author = "Filexa"
-        self.url = "https://github.com/Teutonick/Filexa2wan2gp"
+        self.url = PLUGIN_REPO_URL
         self._config_path = Path(__file__).with_name("filexa2wan2gp_config.json")
         self._config_lock = threading.RLock()
         self._config = self._load_config()
         self._worker_stop = threading.Event()
         self._worker_thread: threading.Thread | None = None
-        self._api_session: Any = None
+        self._ui_ready = False
+        self._headless_session: Any = None
+        self._session_lock = threading.RLock()
         self._active_runtime: TaskRuntime | None = None
         self._active_job: Any = None
+        self._live_lock = threading.RLock()
+        self._live_status = "idle"
+        self._live_progress: int | None = None
+        self._last_video_settings: dict[str, Any] = self._settings_from_text(self._config.default_video_settings_json)
+        self._last_image_settings: dict[str, Any] = self._settings_from_text(self._config.default_settings_json)
 
     def setup_ui(self) -> None:
         self.request_component("state")
         self.request_global("get_current_model_settings")
+        self.request_global("get_model_def")
         self.add_tab(
             tab_id=CONNECTOR_ID,
-            label="Filexa2Wan2GP Connector",
+            label=CONNECTOR_TAB_LABEL,
             component_constructor=self.create_ui,
         )
 
+    def on_tab_select(self, state: dict[str, Any]) -> tuple[str, str, str, str, list[str]]:
+        if not self._config_snapshot().manual_snapshot_mode:
+            self._capture_current_settings_from_state(state, source="auto on tab open")
+        return self._ui_tick(include_snapshot_json=True)
+
     def create_ui(self, api_session: Any) -> None:
-        self._api_session = api_session
+        self._ui_ready = True
+        self._debug(f"UI loaded from {Path(__file__).resolve()}")
         self._ensure_worker()
 
         with gr.Column():
             gr.Markdown(
-                "### Filexa2Wan2GP Connector\n"
+                f"### {CONNECTOR_TAB_LABEL}\n"
+                f"<small>Version: {CONNECTOR_VERSION}</small>\n\n"
                 "Connect this WanGP instance to Filexa local generation. All traffic is outbound "
-                "from this PC to the configured Filexa API URL."
+                f"from this PC to the configured [Filexa]({FILEXA_BOT_URL}) API URL.\n\n"
+                f"Plugin source: [Teutonick/Filexa2wan2gp]({PLUGIN_REPO_URL}).\n\n"
+                "- Set the Filexa API URL and token, enable the connector, then click Save / reconnect.\n"
+                "- On the WanGP Video Generator tab, choose the model and generation settings; Filexa "
+                "task prompt/reference fields take priority.\n"
+                "- Keep WanGP running. The connector is ready to receive Filexa tasks."
             )
+            activity = gr.HTML(value=self._render_activity_html())
             with gr.Row():
                 api_url = gr.Textbox(label="Filexa API URL", value=self._config.api_url, scale=2)
                 token = gr.Textbox(label="Filexa token", value="", type="password", scale=2)
             with gr.Row():
                 enabled = gr.Checkbox(label="Enable connector", value=self._config.enabled)
-                debug_logging = gr.Checkbox(label="Debug logging", value=self._config.debug_logging)
                 compress_images = gr.Checkbox(
                     label="JPEG fallback before upload",
                     value=self._config.compress_images_before_upload,
@@ -315,34 +348,55 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                     label="Keep result on this PC only",
                     value=self._config.keep_result_on_pc_only,
                 )
-            settings_json = gr.Textbox(
-                label="Default WanGP image/settings JSON",
-                value=self._config.default_settings_json,
-                lines=14,
-                placeholder=(
-                    "Optional. Paste a WanGP Export Settings JSON or click Capture current WanGP settings. "
-                    "Filexa task params are merged over these defaults and Filexa prompt always wins."
-                ),
+                manual_snapshot_mode = gr.Checkbox(
+                    label="Manual settings snapshots",
+                    value=self._config.manual_snapshot_mode,
+                )
+            reference_gallery = gr.Gallery(
+                label="Input references for active task",
+                value=self._reference_gallery_value(),
+                columns=4,
+                rows=1,
+                height=150,
+                object_fit="contain",
+                preview=True,
             )
-            video_settings_json = gr.Textbox(
-                label="Default WanGP video settings JSON",
-                value=self._config.default_video_settings_json,
-                lines=14,
-                placeholder=(
-                    "Optional. Paste/capture a WanGP settings JSON configured for text-to-video or image-to-video. "
-                    "Video Filexa tasks use this first, then task params, then the Filexa prompt/reference."
-                ),
-            )
+            with gr.Accordion("Manual snapshots and advanced task JSON", open=False):
+                gr.Markdown(
+                    "In the default mode these snapshots are refreshed automatically for the matching "
+                    "task type before generation. Enable manual snapshots only when you want to freeze "
+                    "WanGP settings and update them by button."
+                )
+                settings_json = gr.Textbox(
+                    label="Manual WanGP image snapshot JSON",
+                    value=self._config.default_settings_json,
+                    lines=10,
+                    placeholder=(
+                        "Optional. Paste a WanGP Export Settings JSON for image output, or click "
+                        "Update image snapshot after configuring WanGP image settings."
+                    ),
+                )
+                video_settings_json = gr.Textbox(
+                    label="Manual WanGP video snapshot JSON",
+                    value=self._config.default_video_settings_json,
+                    lines=10,
+                    placeholder=(
+                        "Optional. Paste/capture a WanGP settings JSON configured for text-to-video "
+                        "or image-to-video output."
+                    ),
+                )
+                with gr.Row():
+                    capture_btn = gr.Button("Update image snapshot")
+                    capture_video_btn = gr.Button("Update video snapshot")
             with gr.Row():
                 save_btn = gr.Button("Save / reconnect", variant="primary")
-                capture_btn = gr.Button("Capture current settings as image defaults")
-                capture_video_btn = gr.Button("Capture current settings as video defaults")
                 refresh_btn = gr.Button("Refresh status")
                 cancel_btn = gr.Button("Cancel active task")
                 disconnect_btn = gr.Button("Disconnect")
-            status = gr.Textbox(label="Status", value=self._render_status(), lines=12, interactive=False)
+            status = gr.Textbox(label="Status", value=self._render_status(), lines=20, interactive=False)
             capture_image_target = gr.State("image")
             capture_video_target = gr.State("video")
+            self.on_tab_outputs = [settings_json, video_settings_json, activity, status, reference_gallery]
 
         save_btn.click(
             fn=self._ui_save,
@@ -350,42 +404,57 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 api_url,
                 token,
                 enabled,
-                debug_logging,
                 compress_images,
                 local_only,
+                manual_snapshot_mode,
                 settings_json,
                 video_settings_json,
             ],
-            outputs=[status],
+            outputs=[activity, status],
             queue=False,
         )
         capture_btn.click(
             fn=self._ui_capture_current_settings,
             inputs=[self.state, capture_image_target],
-            outputs=[settings_json, status],
+            outputs=[settings_json, activity, status],
             queue=False,
         )
         capture_video_btn.click(
             fn=self._ui_capture_current_settings,
             inputs=[self.state, capture_video_target],
-            outputs=[video_settings_json, status],
+            outputs=[video_settings_json, activity, status],
             queue=False,
         )
-        refresh_btn.click(fn=self._render_status, outputs=[status], queue=False)
-        cancel_btn.click(fn=self._ui_cancel_active_task, outputs=[status], queue=False)
-        disconnect_btn.click(fn=self._ui_disconnect, outputs=[status], queue=False)
+        refresh_btn.click(fn=self._ui_tick_status, outputs=[activity, status, reference_gallery], queue=False)
+        cancel_btn.click(fn=self._ui_cancel_active_task, outputs=[activity, status], queue=False)
+        disconnect_btn.click(fn=self._ui_disconnect, outputs=[activity, status], queue=False)
+        timer = _make_timer()
+        if timer is not None:
+            timer.tick(fn=self._ui_tick_status, outputs=[activity, status, reference_gallery], queue=False)
 
     def _ui_save(
         self,
         api_url: str,
         token: str,
         enabled: bool,
-        debug_logging: bool,
         compress_images: bool,
         local_only: bool,
+        manual_snapshot_mode: bool,
         settings_json: str,
         video_settings_json: str,
-    ) -> str:
+    ) -> tuple[str, str]:
+        saved_video_settings_json = video_settings_json.strip()
+        saved_image_settings_json = settings_json.strip()
+        image_settings = self._settings_from_text(saved_image_settings_json)
+        video_settings = self._settings_from_text(saved_video_settings_json)
+        if saved_image_settings_json and not image_settings:
+            _json_object(saved_image_settings_json)
+        if saved_video_settings_json and not video_settings:
+            _json_object(saved_video_settings_json)
+        if image_settings and self._settings_media_kind(image_settings) != "image":
+            raise gr.Error("Image snapshot JSON does not look like WanGP image-output settings.")
+        if video_settings and self._settings_media_kind(video_settings) != "video":
+            raise gr.Error("Video snapshot JSON does not look like WanGP video-output settings.")
         with self._config_lock:
             config = copy.deepcopy(self._config)
             config.api_url = _clean_base_url(api_url) if api_url.strip() or enabled else ""
@@ -395,48 +464,39 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 config.token = token.strip()
             if enabled and (not config.api_url or not config.token):
                 raise gr.Error("Filexa API URL and token are required before enabling the connector.")
-            if settings_json.strip():
-                _json_object(settings_json)
-            if video_settings_json.strip():
-                _json_object(video_settings_json)
-            config.default_settings_json = settings_json.strip()
-            config.default_video_settings_json = video_settings_json.strip()
+            if image_settings:
+                self._last_image_settings = copy.deepcopy(image_settings)
+            if video_settings:
+                self._last_video_settings = copy.deepcopy(video_settings)
+            config.default_settings_json = saved_image_settings_json
+            config.default_video_settings_json = saved_video_settings_json
             config.enabled = bool(enabled)
-            config.debug_logging = bool(debug_logging)
             config.compress_images_before_upload = bool(compress_images)
             config.keep_result_on_pc_only = bool(local_only)
+            config.manual_snapshot_mode = bool(manual_snapshot_mode)
             config.status = "enabled" if config.enabled else "disabled"
             config.last_event = "Configuration saved"
             config.last_error = ""
             self._config = config
+            self._remember_diagnostic_locked(f"Configuration saved in {Path(__file__).resolve()}")
             self._save_config_locked()
         self._ensure_worker()
-        return self._render_status()
+        return self._render_activity_html(), self._render_status()
 
-    def _ui_capture_current_settings(self, state: dict[str, Any], target: str = "image") -> tuple[str, str]:
-        if not callable(getattr(self, "get_current_model_settings", None)):
-            raise gr.Error("WanGP did not expose current settings to this plugin.")
-        try:
-            settings = self.get_current_model_settings(state)
-        except Exception as exc:
-            raise gr.Error(f"Could not read current WanGP settings: {exc}") from exc
-        if not isinstance(settings, dict):
+    def _ui_capture_current_settings(self, state: dict[str, Any], target: str = "image") -> tuple[str, str, str]:
+        settings = self._current_wangp_settings_from_state(state)
+        if not settings:
             raise gr.Error("WanGP returned invalid settings.")
-        clean = copy.deepcopy(settings)
-        clean.pop("client_id", None)
-        captured = json.dumps(clean, indent=2, ensure_ascii=False)
-        with self._config_lock:
-            if target == "video":
-                self._config.default_video_settings_json = captured
-                self._config.last_event = "Captured current WanGP video settings"
-            else:
-                self._config.default_settings_json = captured
-                self._config.last_event = "Captured current WanGP image settings"
-            self._config.last_error = ""
-            self._save_config_locked()
-        return captured, self._render_status()
+        captured = self._store_settings_snapshot(
+            str(target or "image"),
+            settings,
+            source=f"manual {target} snapshot",
+            event=f"Updated {target} snapshot",
+            strict=True,
+        )
+        return captured, self._render_activity_html(), self._render_status()
 
-    def _ui_disconnect(self) -> str:
+    def _ui_disconnect(self) -> tuple[str, str]:
         runtime = self._active_runtime
         if runtime is not None:
             runtime.cancel_event.set()
@@ -453,15 +513,17 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             self._config.last_error = ""
             self._clear_active_locked()
             self._save_config_locked()
-        return self._render_status()
+        self._close_headless_session()
+        self._set_live_progress("idle", None)
+        return self._render_activity_html(), self._render_status()
 
-    def _ui_cancel_active_task(self) -> str:
+    def _ui_cancel_active_task(self) -> tuple[str, str]:
         runtime = self._active_runtime
         if runtime is None:
             with self._config_lock:
                 self._config.last_event = "No active task to cancel"
                 self._save_config_locked()
-            return self._render_status()
+            return self._render_activity_html(), self._render_status()
         runtime.cancel_event.set()
         if self._active_job is not None and not getattr(self._active_job, "done", False):
             try:
@@ -474,11 +536,11 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             client.close()
         except Exception as exc:
             self._debug(f"Cancel report skipped: {exc}")
-        with self._config_lock:
-            self._config.status = "canceling"
-            self._config.last_event = "Cancel requested"
-            self._save_config_locked()
-        return self._render_status()
+        self._close_headless_session()
+        self._active_job = None
+        self._active_runtime = None
+        self._finish_runtime("canceled", "Cancel requested", runtime.started_at)
+        return self._render_activity_html(), self._render_status()
 
     def _ensure_worker(self) -> None:
         if self._worker_thread is not None and self._worker_thread.is_alive():
@@ -496,8 +558,8 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         while not self._worker_stop.is_set():
             client: FilexaClient | None = None
             try:
-                if self._api_session is None:
-                    self._set_status("waiting", "Waiting for WanGP session")
+                if not self._ui_ready:
+                    self._set_status("waiting", "Waiting for WanGP UI")
                     self._sleep_interruptible(POLL_DELAY_SECONDS)
                     continue
                 config = self._config_snapshot()
@@ -527,9 +589,15 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                     self._set_status("enabled", "Polling Filexa")
                     self._sleep_interruptible(POLL_DELAY_SECONDS)
             except FilexaUnauthorizedError as exc:
-                self._set_error("unauthorized", str(exc), disable=True)
+                self._disable_after_filexa_failure(str(exc))
                 self._sleep_interruptible(POLL_DELAY_SECONDS)
             except Exception as exc:
+                if _is_filexa_server_unavailable(exc):
+                    self._disable_after_filexa_failure(
+                        "Filexa server is unavailable; check the API URL, server, network path, and connect again."
+                    )
+                    self._sleep_interruptible(POLL_DELAY_SECONDS)
+                    continue
                 consecutive_errors += 1
                 self._set_error("error", f"Worker error: {exc}")
                 self._sleep_interruptible(min(60, POLL_DELAY_SECONDS * max(1, consecutive_errors)))
@@ -543,6 +611,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         temp_dir = Path(tempfile.mkdtemp(prefix="filexa2wangp_"))
         runtime = TaskRuntime(task=task, temp_dir=temp_dir, started_at=started_at)
         self._active_runtime = runtime
+        self._set_live_progress("task received", 0)
         with self._config_lock:
             self._config.active_job_id = str(task["job_id"])
             self._config.active_kind = str(task.get("kind") or "")
@@ -557,8 +626,13 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             self._post_task_status_safe(client, task, "preparing WanGP task", 8)
             wangp_task = self._build_wangp_task(task, client, temp_dir)
             callbacks = FilexaProgressCallbacks(self, runtime, client)
+            session = self._worker_wangp_session()
+            self._debug(
+                f"Submitting task {task['job_id']} via {session.__class__.__module__}."
+                f"{session.__class__.__name__}"
+            )
             self._post_task_status_safe(client, task, "generating in WanGP", 15)
-            job = self._api_session.submit_task(wangp_task, callbacks=callbacks)
+            job = session.submit_task(wangp_task, callbacks=callbacks)
             self._active_job = job
             result = job.result()
             if runtime.cancel_event.is_set() or bool(getattr(result, "cancelled", False)):
@@ -573,19 +647,63 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 raise RuntimeError("WanGP completed without returning an output file")
             self._post_task_status_safe(client, task, "uploading result", 94)
             self._deliver_output(client, task, output_path)
+            params = wangp_task.get("params") if isinstance(wangp_task, dict) else {}
+            self._remember_successful_snapshot(
+                str(task.get("kind") or ""),
+                params if isinstance(params, dict) else {},
+            )
             self._finish_runtime("completed", f"Task complete: {output_path.name}", started_at)
         except FilexaUnauthorizedError:
             raise
         except Exception as exc:
-            self._report_failure_safe(client, task, str(exc))
-            self._finish_runtime("failed", f"Task failed: {_short_text(str(exc), 300)}", started_at, error=str(exc))
+            if runtime.cancel_event.is_set():
+                self._report_cancel_safe(client, task, "Canceled in Filexa2Wan2GP Connector")
+                self._finish_runtime("canceled", "Task canceled", started_at)
+                return
+            if _is_filexa_server_unavailable(exc):
+                raise
+            error = _worker_error_message(exc)
+            self._debug(f"Task failed: {traceback.format_exc()}")
+            self._report_failure_safe(client, task, error)
+            self._finish_runtime("failed", f"Task failed: {_short_text(error, 300)}", started_at, error=error)
         finally:
             self._active_job = None
             self._active_runtime = None
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def _worker_wangp_session(self) -> Any:
+        with self._session_lock:
+            if self._headless_session is not None:
+                return self._headless_session
+            self._set_status("initializing", "Initializing WanGP worker session")
+            try:
+                from shared.api import init as init_wangp_session
+            except Exception as exc:
+                raise RuntimeError("WanGP in-process API is unavailable. Update WanGP and restart it.") from exc
+            self._headless_session = init_wangp_session(
+                console_output=False,
+                console_isatty=False,
+            )
+            self._set_worker_backend(
+                f"headless(shared.api.init) -> {self._headless_session.__class__.__module__}."
+                f"{self._headless_session.__class__.__name__}"
+            )
+            return self._headless_session
+
+    def _close_headless_session(self) -> None:
+        with self._session_lock:
+            session = self._headless_session
+            self._headless_session = None
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception as exc:
+            self._debug(f"WanGP worker session close skipped: {exc}")
+
     def _build_wangp_task(self, task: dict[str, Any], client: FilexaClient, temp_dir: Path) -> dict[str, Any]:
-        base = self._default_wangp_settings(str(task.get("kind") or ""))
+        kind = str(task.get("kind") or "")
+        base = self._default_wangp_settings(kind)
         params = task.get("params") if isinstance(task.get("params"), dict) else {}
         wangp_task_override = params.get("wangp_task") if isinstance(params.get("wangp_task"), dict) else None
         if wangp_task_override is not None:
@@ -607,25 +725,248 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         prepared_params.setdefault("_api", {"return_media": True})
         if isinstance(prepared_params.get("_api"), dict):
             prepared_params["_api"].setdefault("return_media", True)
+        self._force_output_kind_settings(kind, prepared_params)
         self._attach_references(task, client, temp_dir, prepared_params, params)
+        if not str(prepared_params.get("model_type") or "").strip():
+            raise RuntimeError(self._missing_settings_message(_snapshot_kind_for_task(kind)))
         prepared["id"] = task["job_id"]
         prepared["params"] = prepared_params
         prepared.setdefault("plugin_data", {})
         return prepared
 
     def _default_wangp_settings(self, kind: str = "") -> dict[str, Any]:
-        with self._config_lock:
-            text = (
-                self._config.default_video_settings_json
-                if kind == "video" and self._config.default_video_settings_json.strip()
-                else self._config.default_settings_json
+        target = _snapshot_kind_for_task(kind)
+        if not self._config_snapshot().manual_snapshot_mode:
+            self._capture_current_settings_for_kind(target, source="auto before task")
+        snapshot = self._live_settings_snapshot(target)
+        if _settings_has_model_type(snapshot):
+            media_kind = self._settings_media_kind(snapshot)
+            if media_kind == target:
+                self._set_settings_source(f"{target} snapshot: {_settings_model_type(snapshot)}")
+                return snapshot
+            self._remember_diagnostic(
+                f"Ignored cached {target} snapshot because it looks like {media_kind} settings."
             )
+        with self._config_lock:
+            text = self._config.default_video_settings_json if target == "video" else self._config.default_settings_json
         if not text.strip():
-            return {}
+            self._set_settings_source(f"missing {target} snapshot")
+            raise RuntimeError(self._missing_settings_message(target))
         payload = _json_object(text)
-        if isinstance(payload.get("params"), dict):
-            return copy.deepcopy(payload["params"])
-        return copy.deepcopy(payload)
+        settings = _settings_from_payload(payload)
+        if not _settings_has_model_type(settings):
+            self._set_settings_source(f"invalid {target} snapshot")
+            raise RuntimeError(self._missing_settings_message(target))
+        media_kind = self._settings_media_kind(settings)
+        if media_kind != target:
+            raise RuntimeError(
+                f"The saved WanGP {target} snapshot is actually {media_kind} settings. "
+                f"Choose a WanGP {target} configuration and update the {target} snapshot."
+            )
+        self._remember_live_settings(target, settings)
+        self._set_settings_source(f"saved {target} snapshot: {_settings_model_type(settings)}")
+        return settings
+
+    def _force_output_kind_settings(self, kind: str, settings: dict[str, Any]) -> None:
+        target = _snapshot_kind_for_task(kind)
+        if target == "video":
+            settings["image_mode"] = 0
+            return
+        try:
+            image_mode = int(settings.get("image_mode") or 0)
+        except (TypeError, ValueError):
+            image_mode = 0
+        if image_mode <= 0:
+            settings["image_mode"] = 1
+
+    def _current_wangp_settings_from_component(self) -> dict[str, Any]:
+        state_component = getattr(self, "state", None)
+        state = getattr(state_component, "value", None)
+        return self._current_wangp_settings_from_state(state)
+
+    def _current_wangp_settings_from_state(self, state: Any) -> dict[str, Any]:
+        getter = getattr(self, "get_current_model_settings", None)
+        if not callable(getter):
+            return {}
+        if not isinstance(state, dict):
+            return {}
+        try:
+            settings = getter(state)
+        except Exception as exc:
+            self._debug(f"Could not read current Video Generator settings: {exc}")
+            return {}
+        if not isinstance(settings, dict):
+            return {}
+        clean = copy.deepcopy(settings)
+        model_type = _state_model_type(state)
+        if model_type and not str(clean.get("model_type") or "").strip():
+            clean["model_type"] = model_type
+        clean.pop("client_id", None)
+        clean.pop("state", None)
+        clean.pop("plugin_data", None)
+        return clean
+
+    def _live_settings_snapshot(self, target: str) -> dict[str, Any]:
+        with self._config_lock:
+            return copy.deepcopy(self._last_video_settings if target == "video" else self._last_image_settings)
+
+    def _remember_live_settings(self, target: str, settings: dict[str, Any]) -> None:
+        with self._config_lock:
+            if target == "video":
+                self._last_video_settings = copy.deepcopy(settings)
+            else:
+                self._last_image_settings = copy.deepcopy(settings)
+
+    def _capture_current_settings_for_kind(self, target: str, *, source: str) -> dict[str, Any]:
+        settings = self._current_wangp_settings_from_component()
+        if not settings:
+            self._remember_diagnostic(f"Could not auto-update {target} snapshot: current WanGP settings are unavailable.")
+            return {}
+        return self._store_settings_snapshot(
+            target,
+            settings,
+            source=source,
+            event=f"Updated {target} snapshot",
+            strict=False,
+            return_settings=True,
+        )
+
+    def _capture_current_settings_from_state(self, state: Any, *, source: str) -> dict[str, Any]:
+        settings = self._current_wangp_settings_from_state(state)
+        if not settings:
+            self._remember_diagnostic("Could not auto-update snapshot: current WanGP settings are unavailable.")
+            return {}
+        target = self._settings_media_kind(settings)
+        if target not in {"image", "video"}:
+            self._remember_diagnostic(f"Skipped auto-update for unsupported WanGP {target} settings.")
+            return {}
+        return self._store_settings_snapshot(
+            target,
+            settings,
+            source=source,
+            event=f"Updated {target} snapshot",
+            strict=False,
+            return_settings=True,
+        )
+
+    def _store_settings_snapshot(
+        self,
+        target: str,
+        settings: dict[str, Any],
+        *,
+        source: str,
+        event: str,
+        strict: bool,
+        return_settings: bool = False,
+    ):
+        target = "video" if target == "video" else "image"
+        clean = copy.deepcopy(settings)
+        if not _settings_has_model_type(clean):
+            message = f"Choose a WanGP {target} model/settings before updating the {target} snapshot."
+            if strict:
+                raise gr.Error(message)
+            self._remember_diagnostic(message)
+            return {} if return_settings else ""
+        media_kind = self._settings_media_kind(clean)
+        if media_kind != target:
+            message = (
+                f"Current WanGP settings look like {media_kind} output, not {target}. "
+                f"The {target} snapshot was not changed."
+            )
+            if strict:
+                raise gr.Error(message)
+            self._remember_diagnostic(message)
+            return {} if return_settings else ""
+        captured = json.dumps(clean, indent=2, ensure_ascii=False)
+        model_type = _settings_model_type(clean)
+        with self._config_lock:
+            if target == "video":
+                changed = captured != self._config.default_video_settings_json
+                self._last_video_settings = clean
+                self._config.default_video_settings_json = captured
+            else:
+                changed = captured != self._config.default_settings_json
+                self._last_image_settings = clean
+                self._config.default_settings_json = captured
+            self._config.settings_source = f"{source} {target}: {model_type}" if model_type else f"{source} {target}"
+            self._config.last_event = event
+            self._config.last_error = ""
+            if changed:
+                self._remember_diagnostic_locked(f"{event}: kind={target} model_type={model_type or '-'}")
+            self._save_config_locked()
+        return clean if return_settings else captured
+
+    def _remember_successful_snapshot(self, kind: str, settings: dict[str, Any]) -> None:
+        target = _snapshot_kind_for_task(kind)
+        clean = copy.deepcopy(settings)
+        if not _settings_has_model_type(clean):
+            return
+        media_kind = self._settings_media_kind(clean)
+        if media_kind != target:
+            self._remember_diagnostic(
+                f"Successful {target} task returned {media_kind} settings; snapshot was not persisted."
+            )
+            return
+        captured = json.dumps(clean, indent=2, ensure_ascii=False)
+        model_type = _settings_model_type(clean)
+        with self._config_lock:
+            if target == "video":
+                self._last_video_settings = clean
+                self._config.default_video_settings_json = captured
+                self._config.last_success_video_settings_json = captured
+            else:
+                self._last_image_settings = clean
+                self._config.default_settings_json = captured
+                self._config.last_success_settings_json = captured
+            self._config.settings_source = f"last successful {target}: {model_type}"
+            self._remember_diagnostic_locked(
+                f"Saved last successful {target} snapshot: model_type={model_type or '-'}"
+            )
+            self._save_config_locked()
+
+    def _settings_media_kind(self, settings: dict[str, Any]) -> str:
+        mode = str(settings.get("mode") or "").strip().lower()
+        if mode in {"edit_audio", "edit_remux"}:
+            return "audio"
+        model_def = self._model_def(settings)
+        if bool(model_def.get("audio_only", False)):
+            return "audio"
+        return _settings_media_kind_guess(settings)
+
+    def _model_def(self, settings: dict[str, Any]) -> dict[str, Any]:
+        getter = getattr(self, "get_model_def", None)
+        if not callable(getter):
+            return {}
+        model_type = _settings_model_type(settings)
+        if not model_type:
+            return {}
+        try:
+            model_def = getter(model_type)
+        except Exception as exc:
+            self._debug(f"Could not read WanGP model definition for {model_type}: {exc}")
+            return {}
+        return model_def if isinstance(model_def, dict) else {}
+
+    def _missing_settings_message(self, target: str) -> str:
+        if self._config_snapshot().manual_snapshot_mode:
+            return (
+                f"WanGP {target} settings snapshot is missing. In Filexa2Wan2GP, open Manual "
+                f"snapshots and click Update {target} snapshot after selecting a suitable WanGP model."
+            )
+        return (
+            f"WanGP {target} settings are not configured. Open WanGP Video Generator, choose a "
+            f"{target}-output model/settings, then keep Filexa2Wan2GP open or update the {target} "
+            "snapshot manually."
+        )
+
+    @staticmethod
+    def _settings_from_text(text: str) -> dict[str, Any]:
+        if not str(text or "").strip():
+            return {}
+        try:
+            return _settings_from_payload(_json_object(text))
+        except Exception:
+            return {}
 
     def _attach_references(
         self,
@@ -645,6 +986,10 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             paths.append(str(self._download_reference(client, reference, index, temp_dir)))
         if not paths:
             return
+        runtime = self._active_runtime
+        if runtime is not None:
+            runtime.reference_paths = list(paths)
+        self._remember_diagnostic(f"Received {len(paths)} Filexa reference(s) for task {task.get('job_id')}")
         bindings = task_params.get("reference_bindings")
         if isinstance(bindings, dict):
             for key, spec in bindings.items():
@@ -655,8 +1000,19 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                     settings[key] = value
             return
         if str(task.get("kind") or "") in {"image_edit", "video"}:
-            settings.setdefault("image_start", paths[0])
-            settings.setdefault("image_refs", paths)
+            settings["image_start"] = paths[0] if len(paths) == 1 else paths
+            settings["image_refs"] = paths
+            self._enable_reference_prompt_mode(settings, str(task.get("kind") or ""))
+
+    def _enable_reference_prompt_mode(self, settings: dict[str, Any], kind: str) -> None:
+        if kind not in {"image_edit", "video"}:
+            return
+        model_def = self._model_def(settings)
+        allowed = str(model_def.get("image_prompt_types_allowed") or "")
+        if "S" in allowed:
+            settings["image_prompt_type"] = _add_sequence_letter(str(settings.get("image_prompt_type") or ""), "S")
+        if _model_accepts_image_refs(model_def):
+            settings["video_prompt_type"] = _add_sequence_letter(str(settings.get("video_prompt_type") or ""), "I")
 
     def _download_reference(
         self,
@@ -741,6 +1097,18 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 client,
                 task,
                 "WanGP produced a file that Filexa cannot upload yet. The result stayed on your PC.",
+            )
+            return
+        if (
+            _snapshot_kind_for_task(str(task.get("kind") or "")) == "image"
+            and payload.mime_type in SUPPORTED_VIDEO_MIMES
+        ):
+            self._post_task_status_safe(client, task, "video kept on this PC", 100)
+            self._report_complete(
+                client,
+                task,
+                "WanGP generated a video for an image task, so the file stayed on your PC. "
+                "Check that the saved WanGP image snapshot uses an image-output mode.",
             )
             return
         if self._config_snapshot().keep_result_on_pc_only:
@@ -1018,12 +1386,15 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
 
     def _post_task_status_safe(self, client: FilexaClient, task: dict[str, Any], status: str, progress: int | None) -> None:
         path = str(task.get("status_url") or "")
+        clean_status = _short_text(status, 120)
+        clean_progress = _coerce_progress(progress)
+        self._set_live_progress(clean_status, clean_progress)
         if not path:
             return
         try:
             client.post_json(
                 path,
-                {"status": _short_text(status, 120), "progress": _coerce_progress(progress)},
+                {"status": clean_status, "progress": clean_progress},
                 timeout=STATUS_TIMEOUT,
             )
         except Exception as exc:
@@ -1043,24 +1414,70 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             self._config.updated_at_utc = _utc_now_iso()
             self._save_config_locked()
 
+    def _set_worker_backend(self, backend: str) -> None:
+        with self._config_lock:
+            clean = _short_text(backend, 240)
+            if self._config.worker_backend != clean:
+                self._config.worker_backend = clean
+                self._remember_diagnostic_locked(f"Worker backend: {clean}")
+                self._save_config_locked()
+
+    def _set_settings_source(self, source: str) -> None:
+        with self._config_lock:
+            clean = _short_text(source, 240)
+            if self._config.settings_source != clean:
+                self._config.settings_source = clean
+                self._remember_diagnostic_locked(f"Settings source: {clean}")
+                self._save_config_locked()
+
+    def _set_live_progress(self, status: str, progress: int | None) -> None:
+        with self._live_lock:
+            self._live_status = _short_text(status or "idle", 160)
+            self._live_progress = _coerce_progress(progress)
+
+    def _live_progress_snapshot(self) -> tuple[str, int | None]:
+        with self._live_lock:
+            return self._live_status, self._live_progress
+
     def _set_error(self, status: str, error: str, *, disable: bool = False) -> None:
         with self._config_lock:
             if disable:
                 self._config.enabled = False
-            self._config.status = status
+            self._config.status = "disabled" if disable else status
             self._config.last_error = _short_text(error, 1000)
             self._config.last_event = _short_text(error, 300)
             self._config.updated_at_utc = _utc_now_iso()
+            self._remember_diagnostic_locked(f"Worker error: {error}")
             self._save_config_locked()
+        if disable:
+            self._set_live_progress("disabled", None)
+
+    def _disable_after_filexa_failure(self, message: str) -> None:
+        with self._config_lock:
+            self._config.enabled = False
+            self._config.status = "disabled"
+            self._config.last_error = ""
+            self._config.last_event = _short_text(message, 300)
+            self._clear_active_locked()
+            self._remember_diagnostic_locked(f"Connector disabled: {message}")
+            self._save_config_locked()
+        self._set_live_progress("disabled", None)
+        self._close_headless_session()
 
     def _finish_runtime(self, status: str, event: str, started_at: float, *, error: str = "") -> None:
         with self._config_lock:
-            self._config.status = "enabled" if status == "completed" else status
+            if status in {"completed", "canceled"}:
+                self._config.status = "enabled" if self._config.enabled else "disabled"
+            else:
+                self._config.status = status
             self._config.last_event = event
             self._config.last_error = _short_text(error, 1000)
             self._config.last_duration_seconds = round(max(0.0, time.monotonic() - started_at), 1)
             self._clear_active_locked()
+            if error:
+                self._remember_diagnostic_locked(f"Task failure: {error}")
             self._save_config_locked()
+        self._set_live_progress("idle" if status in {"completed", "canceled"} else status, None)
 
     def _clear_active_locked(self) -> None:
         self._config.active_job_id = ""
@@ -1077,13 +1494,18 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
 
     def _render_status(self) -> str:
         config = self._config_snapshot()
+        live_status, live_progress = self._live_progress_snapshot()
         lines = [
+            f"Version: {CONNECTOR_VERSION}",
             f"Status: {config.status or 'unknown'}",
             f"Last event: {config.last_event or '-'}",
             f"Token saved: {'yes' if bool(config.token) else 'no'}",
-            f"Debug logging: {'on' if config.debug_logging else 'off'}",
             f"JPEG fallback before upload: {'on' if config.compress_images_before_upload else 'off'}",
             f"Result upload to bot: {'off' if config.keep_result_on_pc_only else 'on'}",
+            f"Manual snapshots: {'on' if config.manual_snapshot_mode else 'off'}",
+            f"Worker backend: {config.worker_backend or 'not initialized'}",
+            f"Settings source: {config.settings_source or '-'}",
+            f"Plugin path: {Path(__file__).resolve()}",
             f"Polls: {config.poll_count}",
         ]
         if config.active_job_id:
@@ -1092,6 +1514,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                     f"Active job: {config.active_job_id}",
                     f"Kind: {config.active_kind or '-'}",
                     f"Elapsed: {_format_elapsed(config.started_at_utc)}",
+                    f"Live stage: {live_status}{f' ({live_progress}%)' if live_progress is not None else ''}",
                     f"Prompt: {config.active_prompt_preview or '-'}",
                 ]
             )
@@ -1103,7 +1526,50 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             lines.append(f"Reference download cache: {self._active_reference_hint()}")
         if config.last_error:
             lines.append(f"Last error: {config.last_error}")
+        if config.diagnostics:
+            lines.append("Last diagnostics:")
+            lines.extend(f"- {item}" for item in config.diagnostics[-8:])
         return "\n".join(lines)
+
+    def _render_activity_html(self) -> str:
+        config = self._config_snapshot()
+        live_status, live_progress = self._live_progress_snapshot()
+        active = bool(config.active_job_id)
+        label = "RUNNING" if active else ("ENABLED" if config.enabled else "DISABLED")
+        color = "#c5221f" if active else ("#188038" if config.enabled else "#5f6368")
+        progress_text = f" {live_progress}%" if active and live_progress is not None else ""
+        job_text = f" job {config.active_job_id}" if active else ""
+        stage = html.escape(live_status or config.last_event or "-")
+        job_text = html.escape(job_text)
+        return (
+            "<div style='border:1px solid #dadce0;border-radius:8px;padding:10px 12px;"
+            "font-size:16px;line-height:1.35;background:#fff;'>"
+            f"<span style='display:inline-block;width:12px;height:12px;border-radius:50%;"
+            f"background:{color};margin-right:8px;vertical-align:-1px;'></span>"
+            f"<b>STATUS: {label}{progress_text}</b>{job_text}<br>"
+            f"<span style='font-size:13px;color:#5f6368;'>Stage: {stage}</span>"
+            "</div>"
+        )
+
+    def _reference_gallery_value(self) -> list[str]:
+        runtime = self._active_runtime
+        if runtime is None:
+            return []
+        return [path for path in runtime.reference_paths if Path(path).is_file()]
+
+    def _ui_tick_status(self) -> tuple[str, str, list[str]]:
+        return self._render_activity_html(), self._render_status(), self._reference_gallery_value()
+
+    def _ui_tick(self, *, include_snapshot_json: bool = False):
+        config = self._config_snapshot()
+        values = [self._render_activity_html(), self._render_status(), self._reference_gallery_value()]
+        if include_snapshot_json:
+            return (
+                config.default_settings_json,
+                config.default_video_settings_json,
+                *values,
+            )
+        return tuple(values)
 
     def _load_config(self) -> FilexaConfig:
         try:
@@ -1116,6 +1582,19 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         for key in asdict(config):
             if key in payload:
                 setattr(config, key, payload[key])
+        if not isinstance(config.diagnostics, list):
+            config.diagnostics = []
+        config.diagnostics = [_short_text(str(item), 400) for item in config.diagnostics[-8:]]
+        config.default_settings_json = _restore_snapshot_text(
+            config.default_settings_json,
+            config.last_success_settings_json,
+            "image",
+        )
+        config.default_video_settings_json = _restore_snapshot_text(
+            config.default_video_settings_json,
+            config.last_success_video_settings_json,
+            "video",
+        )
         if config.active_job_id:
             config.active_job_id = ""
             config.status = "enabled" if config.enabled else "disabled"
@@ -1126,8 +1605,21 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         self._config_path.write_text(json.dumps(asdict(self._config), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _debug(self, message: str) -> None:
-        if self._config_snapshot().debug_logging:
-            print(f"[{CONNECTOR_NAME}] {_short_text(message, 1000)}")
+        with self._config_lock:
+            self._remember_diagnostic_locked(message)
+            self._save_config_locked()
+
+    def _remember_diagnostic_locked(self, message: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        entry = f"{stamp} {_short_text(message, 400)}"
+        diagnostics = list(self._config.diagnostics or [])
+        diagnostics.append(entry)
+        self._config.diagnostics = diagnostics[-8:]
+
+    def _remember_diagnostic(self, message: str) -> None:
+        with self._config_lock:
+            self._remember_diagnostic_locked(message)
+            self._save_config_locked()
 
     def _active_upload_hint(self) -> str:
         with self._config_lock:
@@ -1161,6 +1653,28 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         self._worker_stop.wait(seconds)
 
 
+def _is_filexa_server_unavailable(exc: BaseException) -> bool:
+    if isinstance(exc, FilexaHttpError):
+        return exc.status_code >= 500
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(current, OSError) and getattr(current, "winerror", None) in {
+            10051,  # network unreachable
+            10060,  # connection timed out
+            10061,  # connection refused
+            11001,  # host not found
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _json_object(text: str) -> dict[str, Any]:
     payload = json.loads(text)
     if not isinstance(payload, dict):
@@ -1192,6 +1706,150 @@ def _binding_value(spec: Any, paths: list[str]) -> Any:
     if spec == "first":
         return paths[0] if paths else None
     return None
+
+
+def _worker_error_message(error: BaseException) -> str:
+    text = str(error) or error.__class__.__name__
+    if "live Gradio request with a session hash" in text:
+        return (
+            f"{text} The Filexa2Wan2GP {CONNECTOR_VERSION} worker should use the headless "
+            "WanGP session; restart WanGP after updating the plugin and confirm the Status panel "
+            "shows Worker backend: headless(shared.api.init)."
+        )
+    return text
+
+
+def _settings_has_model_type(settings: dict[str, Any]) -> bool:
+    return bool(isinstance(settings, dict) and str(settings.get("model_type") or "").strip())
+
+
+def _snapshot_kind_for_task(kind: str) -> str:
+    return "video" if str(kind or "") == "video" else "image"
+
+
+def _restore_snapshot_text(current_text: str, last_success_text: str, target: str) -> str:
+    if _snapshot_text_has_kind(current_text, target):
+        return current_text
+    if _snapshot_text_has_kind(last_success_text, target):
+        return last_success_text
+    return "" if str(current_text or "").strip() else current_text
+
+
+def _snapshot_text_has_kind(text: str, target: str) -> bool:
+    clean = str(text or "").strip()
+    if not clean:
+        return False
+    try:
+        settings = _settings_from_payload(_json_object(clean))
+    except Exception:
+        return False
+    return _settings_has_model_type(settings) and _settings_media_kind_guess(settings) == target
+
+
+def _settings_media_kind_guess(settings: dict[str, Any]) -> str:
+    mode = str(settings.get("mode") or "").strip().lower()
+    if mode in {"edit_audio", "edit_remux"}:
+        return "audio"
+    model_type = _settings_model_type(settings).lower()
+    if _model_type_looks_video(model_type):
+        return "video"
+    if _model_type_looks_image(model_type):
+        return "image"
+    try:
+        image_mode = int(settings.get("image_mode") or 0)
+    except (TypeError, ValueError):
+        image_mode = 0
+    return "image" if image_mode > 0 else "video"
+
+
+def _model_type_looks_video(model_type: str) -> bool:
+    hints = (
+        "i2v",
+        "t2v",
+        "v2v",
+        "wan",
+        "ltx",
+        "hunyuan",
+        "skyreels",
+        "cogvideo",
+        "mochi",
+        "video",
+    )
+    return any(hint in model_type for hint in hints)
+
+
+def _model_type_looks_image(model_type: str) -> bool:
+    hints = (
+        "qwen_image",
+        "image_edit",
+        "flux",
+        "kolors",
+        "sdxl",
+        "sd3",
+        "stable_diffusion",
+        "image",
+    )
+    return any(hint in model_type for hint in hints)
+
+
+def _settings_model_type(settings: dict[str, Any]) -> str:
+    if not isinstance(settings, dict):
+        return ""
+    return str(settings.get("model_type") or "").strip()
+
+
+def _model_accepts_image_refs(model_def: dict[str, Any]) -> bool:
+    if not isinstance(model_def, dict):
+        return False
+    if bool(model_def.get("one_image_ref_needed", False)):
+        return True
+    if bool(model_def.get("at_least_one_image_ref_needed", False)):
+        return True
+    choices = model_def.get("image_ref_choices")
+    return isinstance(choices, dict) and bool(choices.get("choices"))
+
+
+def _settings_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(payload.get("params"), dict):
+        return copy.deepcopy(payload["params"])
+    return copy.deepcopy(payload)
+
+
+def _state_model_type(state: Any) -> str:
+    if not isinstance(state, dict):
+        return ""
+    key = "model_type" if state.get("active_form", "add") == "add" else "edit_model_type"
+    value = state.get(key)
+    if value:
+        return str(value).strip()
+    fallback = str(state.get("model_type") or state.get("edit_model_type") or "").strip()
+    if fallback:
+        return fallback
+    all_settings = state.get("all_settings")
+    if isinstance(all_settings, dict) and len(all_settings) == 1:
+        only_key = next(iter(all_settings.keys()))
+        return str(only_key or "").strip()
+    return ""
+
+
+def _add_sequence_letter(value: str, letter: str) -> str:
+    clean = str(value or "")
+    return clean if letter in clean else f"{clean}{letter}"
+
+
+def _make_timer():
+    timer_factory = getattr(gr, "Timer", None)
+    if timer_factory is None:
+        return None
+    try:
+        return timer_factory(value=3.0, active=True)
+    except TypeError:
+        try:
+            return timer_factory(3.0)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 def _clean_base_url(value: str) -> str:

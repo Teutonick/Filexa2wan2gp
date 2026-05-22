@@ -1,10 +1,10 @@
 {
   "name": "Filexa2Wan2GP Connector",
   "author": "Filexa",
-  "version": "0.1.0",
+  "version": "0.8.1",
   "description": "Connects WanGP to Filexa local image/video generation through the Filexa local connector API.",
   "url": "https://github.com/Teutonick/Filexa2wan2gp",
-  "date": "2026-05-21",
+  "date": "2026-05-22",
   "wan2gp_version": "",
   "uninstallable": true
 }
