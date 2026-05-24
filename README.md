@@ -1,3 +1,5 @@
+[English](README.md) | [Русский](README.ru.md)
+
 # Filexa2Wan2GP Connector
 
 Connects Wan2GP to Filexa local generation so Telegram users can run local image and short video jobs on their own PC.
@@ -13,7 +15,9 @@ Not affiliated with, endorsed by, or sponsored by Wan2GP.
 
 - `plugin.py` - Wan2GP plugin implementation.
 - `plugin_info.json` - metadata used by the Wan2GP plugin manager.
+- `API_CONTRACT.md` - bot-side API contract for reusing this connector with another bot/server.
 - `README.md` - installation and usage guide.
+- `README.ru.md` - Russian installation and usage guide.
 - `LICENSE` - source code license.
 - `NOTICE.md` - legal notices and disclaimers.
 - `SECURITY.md` - vulnerability reporting policy.
@@ -38,6 +42,7 @@ The connector is designed to work with https://t.me/WorkOnBigFilesBot only.
    you want to freeze WanGP settings instead of refreshing them automatically before each task.
 
 Once enabled, keep Wan2GP running. The connector makes only outbound HTTP/HTTPS requests to Filexa. No public Wan2GP port is required.
+The bot-side HTTP contract for compatible servers is documented in `API_CONTRACT.md`.
 
 ## Wan2GP Settings
 
@@ -51,6 +56,10 @@ The connector is deliberately generic:
 - Opening the `Filexa2Wan2GP` tab also refreshes and persists the current image/video snapshot in
   the correct slot when manual snapshots are off. This lets the connector remember the user's last
   configured image and video models across WanGP restarts.
+- Successful task snapshots are saved separately as fallback state. They do not replace the current
+  image/video snapshot unless the current saved snapshot is missing, invalid, or the wrong media kind.
+- Saved snapshots strip task-specific reference file paths such as `image_start` and `image_refs`,
+  so a later text-only task cannot reuse a deleted temporary reference from an earlier edit/I2V task.
 - `Manual settings snapshots` is an advanced mode. When it is enabled, the connector never
   refreshes snapshots automatically; use `Update image snapshot` or `Update video snapshot` after
   configuring WanGP manually.
@@ -83,6 +92,10 @@ This keeps the plugin transparent enough for future Wan2GP methods while allowin
   of references received for the active task, so users can see that WanGP is busy even when the main
   WanGP tab is silent.
 - It reports progress through Wan2GP callbacks when progress data is available.
+- While upload/reference chunk fallback cache is active after poor-network transfer trouble, the
+  Status panel shows `⚠️ Unstable network, chunk transfer method temporarily enabled.`
+- Successful result reports include the actual WanGP `model_type` submitted to `shared.api`, so a
+  compatible bot can show it in captions.
 - The `Cancel active task` button asks both Wan2GP and Filexa to cancel the active task, closes the
   worker session, and returns the connector UI to idle/enabled state if Wan2GP accepts the stop.
 

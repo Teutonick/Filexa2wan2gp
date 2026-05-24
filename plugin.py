@@ -61,6 +61,32 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{8,512}$")
 SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 SUPPORTED_VIDEO_MIMES = {"video/mp4", "video/webm", "video/quicktime"}
+SNAPSHOT_REFERENCE_PATH_KEYS = {
+    "control_image",
+    "control_images",
+    "controlnet_image",
+    "controlnet_images",
+    "image_end",
+    "image_ref",
+    "image_refs",
+    "image_reference",
+    "image_references",
+    "image_start",
+    "init_image",
+    "init_images",
+    "input_image",
+    "input_images",
+    "input_reference",
+    "input_references",
+    "mask_image",
+    "mask_images",
+    "reference_image",
+    "reference_images",
+    "reference_path",
+    "reference_paths",
+    "source_image",
+    "source_images",
+}
 
 
 @dataclass
@@ -188,12 +214,15 @@ class FilexaClient:
         payload: UploadPayload,
         *,
         timeout: float,
+        model_type: str = "",
     ) -> None:
         headers = {
             "Content-Type": payload.mime_type,
             "Content-Length": str(len(payload.bytes)),
             "Connection": "close",
         }
+        if model_type:
+            headers["X-Filexa-Model-Type"] = model_type
         response = self.session.post(
             self.absolute_url(path),
             data=payload.bytes,
@@ -212,6 +241,7 @@ class FilexaClient:
         total_bytes: int,
         mime_type: str,
         chunk: bytes,
+        model_type: str = "",
     ) -> None:
         headers = {
             "Content-Type": "application/octet-stream",
@@ -223,6 +253,8 @@ class FilexaClient:
             "X-Filexa-Image-Mime": mime_type,
             "Connection": "close",
         }
+        if model_type:
+            headers["X-Filexa-Model-Type"] = model_type
         response = self.session.post(
             self.absolute_url(f"{chunk_base_path.rstrip('/')}/{index}"),
             data=chunk,
@@ -455,6 +487,10 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             raise gr.Error("Image snapshot JSON does not look like WanGP image-output settings.")
         if video_settings and self._settings_media_kind(video_settings) != "video":
             raise gr.Error("Video snapshot JSON does not look like WanGP video-output settings.")
+        if image_settings:
+            saved_image_settings_json = json.dumps(image_settings, indent=2, ensure_ascii=False)
+        if video_settings:
+            saved_video_settings_json = json.dumps(video_settings, indent=2, ensure_ascii=False)
         with self._config_lock:
             config = copy.deepcopy(self._config)
             config.api_url = _clean_base_url(api_url) if api_url.strip() or enabled else ""
@@ -645,9 +681,10 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             output_path = self._first_output_path(result)
             if output_path is None:
                 raise RuntimeError("WanGP completed without returning an output file")
-            self._post_task_status_safe(client, task, "uploading result", 94)
-            self._deliver_output(client, task, output_path)
             params = wangp_task.get("params") if isinstance(wangp_task, dict) else {}
+            model_type = _result_model_type(params if isinstance(params, dict) else {})
+            self._post_task_status_safe(client, task, "uploading result", 94)
+            self._deliver_output(client, task, output_path, model_type=model_type)
             self._remember_successful_snapshot(
                 str(task.get("kind") or ""),
                 params if isinstance(params, dict) else {},
@@ -726,6 +763,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         if isinstance(prepared_params.get("_api"), dict):
             prepared_params["_api"].setdefault("return_media", True)
         self._force_output_kind_settings(kind, prepared_params)
+        _clear_task_reference_settings(prepared_params)
         self._attach_references(task, client, temp_dir, prepared_params, params)
         if not str(prepared_params.get("model_type") or "").strip():
             raise RuntimeError(self._missing_settings_message(_snapshot_kind_for_task(kind)))
@@ -749,23 +787,43 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             )
         with self._config_lock:
             text = self._config.default_video_settings_json if target == "video" else self._config.default_settings_json
-        if not text.strip():
-            self._set_settings_source(f"missing {target} snapshot")
-            raise RuntimeError(self._missing_settings_message(target))
-        payload = _json_object(text)
-        settings = _settings_from_payload(payload)
-        if not _settings_has_model_type(settings):
+        fallback = self._last_success_settings(target)
+        if text.strip():
+            settings = self._settings_from_text(text)
+            if _settings_has_model_type(settings):
+                media_kind = self._settings_media_kind(settings)
+                if media_kind == target:
+                    self._remember_live_settings(target, settings)
+                    self._set_settings_source(f"saved {target} snapshot: {_settings_model_type(settings)}")
+                    return settings
+                if fallback:
+                    self._remember_diagnostic(
+                        f"Fell back to last successful {target} snapshot because saved snapshot "
+                        f"looks like {media_kind} settings."
+                    )
+                    self._set_settings_source(
+                        f"last successful {target} fallback: {_settings_model_type(fallback)}"
+                    )
+                    return fallback
+                raise RuntimeError(
+                    f"The saved WanGP {target} snapshot is actually {media_kind} settings. "
+                    f"Choose a WanGP {target} configuration and update the {target} snapshot."
+                )
+            if fallback:
+                self._remember_diagnostic(
+                    f"Fell back to last successful {target} snapshot because saved snapshot is invalid."
+                )
+                self._set_settings_source(
+                    f"last successful {target} fallback: {_settings_model_type(fallback)}"
+                )
+                return fallback
             self._set_settings_source(f"invalid {target} snapshot")
             raise RuntimeError(self._missing_settings_message(target))
-        media_kind = self._settings_media_kind(settings)
-        if media_kind != target:
-            raise RuntimeError(
-                f"The saved WanGP {target} snapshot is actually {media_kind} settings. "
-                f"Choose a WanGP {target} configuration and update the {target} snapshot."
-            )
-        self._remember_live_settings(target, settings)
-        self._set_settings_source(f"saved {target} snapshot: {_settings_model_type(settings)}")
-        return settings
+        if fallback:
+            self._set_settings_source(f"last successful {target} fallback: {_settings_model_type(fallback)}")
+            return fallback
+        self._set_settings_source(f"missing {target} snapshot")
+        raise RuntimeError(self._missing_settings_message(target))
 
     def _force_output_kind_settings(self, kind: str, settings: dict[str, Any]) -> None:
         target = _snapshot_kind_for_task(kind)
@@ -860,7 +918,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         return_settings: bool = False,
     ):
         target = "video" if target == "video" else "image"
-        clean = copy.deepcopy(settings)
+        clean = _sanitize_settings_snapshot(settings)
         if not _settings_has_model_type(clean):
             message = f"Choose a WanGP {target} model/settings before updating the {target} snapshot."
             if strict:
@@ -898,7 +956,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
 
     def _remember_successful_snapshot(self, kind: str, settings: dict[str, Any]) -> None:
         target = _snapshot_kind_for_task(kind)
-        clean = copy.deepcopy(settings)
+        clean = _sanitize_settings_snapshot(settings)
         if not _settings_has_model_type(clean):
             return
         media_kind = self._settings_media_kind(clean)
@@ -911,18 +969,28 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         model_type = _settings_model_type(clean)
         with self._config_lock:
             if target == "video":
-                self._last_video_settings = clean
-                self._config.default_video_settings_json = captured
                 self._config.last_success_video_settings_json = captured
             else:
-                self._last_image_settings = clean
-                self._config.default_settings_json = captured
                 self._config.last_success_settings_json = captured
             self._config.settings_source = f"last successful {target}: {model_type}"
             self._remember_diagnostic_locked(
                 f"Saved last successful {target} snapshot: model_type={model_type or '-'}"
             )
             self._save_config_locked()
+
+    def _last_success_settings(self, target: str) -> dict[str, Any]:
+        with self._config_lock:
+            text = (
+                self._config.last_success_video_settings_json
+                if target == "video"
+                else self._config.last_success_settings_json
+            )
+        settings = self._settings_from_text(text)
+        if not _settings_has_model_type(settings):
+            return {}
+        if self._settings_media_kind(settings) != target:
+            return {}
+        return settings
 
     def _settings_media_kind(self, settings: dict[str, Any]) -> str:
         mode = str(settings.get("mode") or "").strip().lower()
@@ -964,7 +1032,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         if not str(text or "").strip():
             return {}
         try:
-            return _settings_from_payload(_json_object(text))
+            return _sanitize_settings_snapshot(_settings_from_payload(_json_object(text)))
         except Exception:
             return {}
 
@@ -1089,7 +1157,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 return data, mime_type
         raise RuntimeError("Too many reference chunks")
 
-    def _deliver_output(self, client: FilexaClient, task: dict[str, Any], path: Path) -> None:
+    def _deliver_output(self, client: FilexaClient, task: dict[str, Any], path: Path, *, model_type: str = "") -> None:
         payload = self._media_payload_from_path(path)
         if payload is None:
             self._post_task_status_safe(client, task, "completed locally", 100)
@@ -1097,6 +1165,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 client,
                 task,
                 "WanGP produced a file that Filexa cannot upload yet. The result stayed on your PC.",
+                model_type=model_type,
             )
             return
         if (
@@ -1109,18 +1178,19 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 task,
                 "WanGP generated a video for an image task, so the file stayed on your PC. "
                 "Check that the saved WanGP image snapshot uses an image-output mode.",
+                model_type=model_type,
             )
             return
         if self._config_snapshot().keep_result_on_pc_only:
             self._post_task_status_safe(client, task, "completed locally", 100)
-            self._report_complete(client, task)
+            self._report_complete(client, task, model_type=model_type)
             return
         if payload.mime_type in SUPPORTED_VIDEO_MIMES:
-            self._deliver_video_output(client, task, payload)
+            self._deliver_video_output(client, task, payload, model_type=model_type)
             return
-        self._deliver_image_output(client, task, payload)
+        self._deliver_image_output(client, task, payload, model_type=model_type)
 
-    def _deliver_video_output(self, client: FilexaClient, task: dict[str, Any], payload: UploadPayload) -> None:
+    def _deliver_video_output(self, client: FilexaClient, task: dict[str, Any], payload: UploadPayload, *, model_type: str = "") -> None:
         if len(payload.bytes) > MAX_UPLOAD_VIDEO_BYTES:
             self._post_task_status_safe(client, task, "video kept on this PC", 100)
             self._report_complete(
@@ -1128,6 +1198,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 task,
                 "WanGP generated a video, but it is larger than Filexa's 50 MB direct upload limit. "
                 "The file stayed on your PC.",
+                model_type=model_type,
             )
             return
         try:
@@ -1136,6 +1207,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 str(task.get("result_upload_url") or ""),
                 payload,
                 timeout=DIRECT_UPLOAD_TIMEOUT,
+                model_type=model_type,
             )
         except FilexaUnauthorizedError:
             raise
@@ -1148,6 +1220,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 task,
                 "WanGP generated the video, but direct upload to Filexa failed. "
                 "The file stayed on your PC; check the network path before retrying.",
+                model_type=model_type,
             )
         except Exception as exc:
             self._debug(f"Video direct upload failed: {exc}")
@@ -1156,9 +1229,10 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 task,
                 "WanGP generated the video, but direct upload to Filexa failed. "
                 "The file stayed on your PC; check the network path before retrying.",
+                model_type=model_type,
             )
 
-    def _deliver_image_output(self, client: FilexaClient, task: dict[str, Any], payload: UploadPayload) -> None:
+    def _deliver_image_output(self, client: FilexaClient, task: dict[str, Any], payload: UploadPayload, *, model_type: str = "") -> None:
         if len(payload.bytes) > MAX_UPLOAD_IMAGE_BYTES:
             converted = self._jpeg_payload(payload)
             payload = converted if converted is not None else payload
@@ -1171,6 +1245,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                     str(task.get("result_upload_url") or ""),
                     direct_payload,
                     timeout=DIRECT_UPLOAD_TIMEOUT,
+                    model_type=model_type,
                 )
                 return
             except FilexaUnauthorizedError:
@@ -1184,14 +1259,14 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         fallback = direct_payload if direct_payload.mime_type == "image/jpeg" else self._jpeg_payload(payload)
         if fallback is None or len(fallback.bytes) > MAX_FALLBACK_IMAGE_BYTES:
             self._post_task_status_safe(client, task, "completed locally", 100)
-            self._report_complete(client, task)
+            self._report_complete(client, task, model_type=model_type)
             return
         preferred = self._active_upload_hint()
         if preferred in {UPLOAD_MODE_TEXT_FAST, UPLOAD_MODE_TEXT_SAFE}:
-            self._upload_text_chunks_adaptive(client, task, fallback, preferred=preferred)
+            self._upload_text_chunks_adaptive(client, task, fallback, preferred=preferred, model_type=model_type)
             return
         try:
-            self._upload_binary_chunks(client, task, fallback)
+            self._upload_binary_chunks(client, task, fallback, model_type=model_type)
             return
         except FilexaUnauthorizedError:
             raise
@@ -1201,9 +1276,9 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             self._debug(f"Binary chunk upload failed: {exc}")
         except Exception as exc:
             self._debug(f"Binary chunk upload failed: {exc}")
-        self._upload_text_chunks_adaptive(client, task, fallback)
+        self._upload_text_chunks_adaptive(client, task, fallback, model_type=model_type)
 
-    def _upload_binary_chunks(self, client: FilexaClient, task: dict[str, Any], payload: UploadPayload) -> None:
+    def _upload_binary_chunks(self, client: FilexaClient, task: dict[str, Any], payload: UploadPayload, *, model_type: str = "") -> None:
         base_path = str(task.get("result_chunk_upload_url") or f"{str(task.get('result_upload_url') or '').rstrip('/')}/chunks")
         client.absolute_url(base_path)
         upload_id = uuid.uuid4().hex
@@ -1221,6 +1296,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 total_bytes=len(payload.bytes),
                 mime_type=payload.mime_type,
                 chunk=chunk,
+                model_type=model_type,
             )
 
     def _upload_text_chunks_adaptive(
@@ -1230,10 +1306,11 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         payload: UploadPayload,
         *,
         preferred: str = "",
+        model_type: str = "",
     ) -> None:
         if preferred != UPLOAD_MODE_TEXT_SAFE:
             try:
-                self._upload_text_chunks(client, task, payload, TEXT_CHUNK_BYTES_FAST, JSON_CHUNK_FAST_DELAY)
+                self._upload_text_chunks(client, task, payload, TEXT_CHUNK_BYTES_FAST, JSON_CHUNK_FAST_DELAY, model_type=model_type)
                 self._remember_upload_hint(UPLOAD_MODE_TEXT_FAST)
                 return
             except FilexaUnauthorizedError:
@@ -1244,7 +1321,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 self._debug(f"Fast JSON/base64 upload failed: {exc}")
             except Exception as exc:
                 self._debug(f"Fast JSON/base64 upload failed: {exc}")
-        self._upload_text_chunks(client, task, payload, TEXT_CHUNK_BYTES_SAFE, JSON_CHUNK_SAFE_DELAY)
+        self._upload_text_chunks(client, task, payload, TEXT_CHUNK_BYTES_SAFE, JSON_CHUNK_SAFE_DELAY, model_type=model_type)
         self._remember_upload_hint(UPLOAD_MODE_TEXT_SAFE)
 
     def _upload_text_chunks(
@@ -1254,6 +1331,8 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         payload: UploadPayload,
         chunk_bytes: int,
         delay: float,
+        *,
+        model_type: str = "",
     ) -> None:
         base_path = str(task.get("result_text_chunk_upload_url") or f"{str(task.get('result_upload_url') or '').rstrip('/')}/text-chunks")
         client.absolute_url(base_path)
@@ -1271,6 +1350,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                     "chunk_count": chunk_count,
                     "total_bytes": len(payload.bytes),
                     "mime_type": payload.mime_type,
+                    "model_type": model_type,
                     "data_b64": base64.b64encode(chunk).decode("ascii"),
                 },
                 timeout=CHUNK_UPLOAD_TIMEOUT,
@@ -1368,8 +1448,17 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             if reference.get("text_chunk_url"):
                 client.absolute_url(str(reference.get("text_chunk_url")))
 
-    def _report_complete(self, client: FilexaClient, task: dict[str, Any], message: str | None = None) -> None:
+    def _report_complete(
+        self,
+        client: FilexaClient,
+        task: dict[str, Any],
+        message: str | None = None,
+        *,
+        model_type: str = "",
+    ) -> None:
         payload = {"message": _short_text(message, 500)} if message else {}
+        if model_type:
+            payload["model_type"] = model_type
         client.post_json(str(task.get("result_complete_url") or ""), payload, timeout=FILEXA_JSON_TIMEOUT)
 
     def _report_failure_safe(self, client: FilexaClient, task: dict[str, Any], error: str) -> None:
@@ -1524,6 +1613,9 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             lines.append(f"Upload mode cache: {self._active_upload_hint()}")
         if self._active_reference_hint():
             lines.append(f"Reference download cache: {self._active_reference_hint()}")
+        notice = self._network_fallback_notice()
+        if notice:
+            lines.append(notice)
         if config.last_error:
             lines.append(f"Last error: {config.last_error}")
         if config.diagnostics:
@@ -1541,6 +1633,14 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         job_text = f" job {config.active_job_id}" if active else ""
         stage = html.escape(live_status or config.last_event or "-")
         job_text = html.escape(job_text)
+        notice = self._network_fallback_notice()
+        notice_html = (
+            "<div style='margin-top:8px;padding:7px 9px;border-radius:6px;"
+            "background:#fff4ce;border:1px solid #f4c430;color:#5f4200;font-size:13px;'>"
+            f"{html.escape(notice)}</div>"
+            if notice
+            else ""
+        )
         return (
             "<div style='border:1px solid #dadce0;border-radius:8px;padding:10px 12px;"
             "font-size:16px;line-height:1.35;background:#fff;'>"
@@ -1548,6 +1648,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             f"background:{color};margin-right:8px;vertical-align:-1px;'></span>"
             f"<b>STATUS: {label}{progress_text}</b>{job_text}<br>"
             f"<span style='font-size:13px;color:#5f6368;'>Stage: {stage}</span>"
+            f"{notice_html}"
             "</div>"
         )
 
@@ -1585,6 +1686,12 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         if not isinstance(config.diagnostics, list):
             config.diagnostics = []
         config.diagnostics = [_short_text(str(item), 400) for item in config.diagnostics[-8:]]
+        config.last_success_settings_json = _normalize_snapshot_text(config.last_success_settings_json)
+        config.last_success_video_settings_json = _normalize_snapshot_text(
+            config.last_success_video_settings_json
+        )
+        config.default_settings_json = _normalize_snapshot_text(config.default_settings_json)
+        config.default_video_settings_json = _normalize_snapshot_text(config.default_video_settings_json)
         config.default_settings_json = _restore_snapshot_text(
             config.default_settings_json,
             config.last_success_settings_json,
@@ -1649,6 +1756,11 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
             ).isoformat()
             self._save_config_locked()
 
+    def _network_fallback_notice(self) -> str:
+        if self._active_upload_hint() or self._active_reference_hint():
+            return "⚠️ Unstable network, chunk transfer method temporarily enabled."
+        return ""
+
     def _sleep_interruptible(self, seconds: float) -> None:
         self._worker_stop.wait(seconds)
 
@@ -1692,6 +1804,75 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def _sanitize_settings_snapshot(settings: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(settings, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    for key, value in settings.items():
+        key_text = str(key)
+        if _is_reference_path_setting(key_text, value):
+            continue
+        if isinstance(value, dict):
+            clean[key_text] = _sanitize_settings_snapshot(value)
+        elif isinstance(value, list):
+            clean[key_text] = [
+                _sanitize_settings_snapshot(item) if isinstance(item, dict) else copy.deepcopy(item)
+                for item in value
+            ]
+        else:
+            clean[key_text] = copy.deepcopy(value)
+    return clean
+
+
+def _clear_task_reference_settings(settings: dict[str, Any]) -> None:
+    if not isinstance(settings, dict):
+        return
+    for key in list(settings.keys()):
+        if _is_reference_path_setting(str(key), settings.get(key)):
+            settings.pop(key, None)
+    if "image_prompt_type" in settings:
+        settings["image_prompt_type"] = _remove_sequence_letter(str(settings.get("image_prompt_type") or ""), "S")
+    if "video_prompt_type" in settings:
+        settings["video_prompt_type"] = _remove_sequence_letter(str(settings.get("video_prompt_type") or ""), "I")
+
+
+def _is_reference_path_setting(key: str, value: Any) -> bool:
+    clean = str(key or "").strip().lower()
+    if clean in SNAPSHOT_REFERENCE_PATH_KEYS:
+        return True
+    if ("ref" in clean or "reference" in clean) and _contains_pathlike_string(value):
+        return True
+    if clean.endswith(("_image", "_images", "_path", "_paths")) and _contains_pathlike_string(value):
+        return True
+    return False
+
+
+def _contains_pathlike_string(value: Any) -> bool:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+        if re.search(r"^[A-Za-z]:[\\/]", text):
+            return True
+        if text.startswith(("/", "\\")):
+            return True
+        if "\\" in text or "/" in text:
+            suffix = Path(text).suffix.lower()
+            return suffix in {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
+        return False
+    if isinstance(value, list):
+        return any(_contains_pathlike_string(item) for item in value)
+    if isinstance(value, tuple):
+        return any(_contains_pathlike_string(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_pathlike_string(item) for item in value.values())
+    return False
+
+
+def _remove_sequence_letter(value: str, letter: str) -> str:
+    return "".join(char for char in str(value or "") if char != letter)
+
+
 def _binding_value(spec: Any, paths: list[str]) -> Any:
     if isinstance(spec, int):
         return paths[spec] if 0 <= spec < len(paths) else None
@@ -1727,6 +1908,17 @@ def _snapshot_kind_for_task(kind: str) -> str:
     return "video" if str(kind or "") == "video" else "image"
 
 
+def _normalize_snapshot_text(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return ""
+    try:
+        settings = _sanitize_settings_snapshot(_settings_from_payload(_json_object(clean)))
+    except Exception:
+        return clean
+    return json.dumps(settings, indent=2, ensure_ascii=False)
+
+
 def _restore_snapshot_text(current_text: str, last_success_text: str, target: str) -> str:
     if _snapshot_text_has_kind(current_text, target):
         return current_text
@@ -1740,7 +1932,7 @@ def _snapshot_text_has_kind(text: str, target: str) -> bool:
     if not clean:
         return False
     try:
-        settings = _settings_from_payload(_json_object(clean))
+        settings = _sanitize_settings_snapshot(_settings_from_payload(_json_object(clean)))
     except Exception:
         return False
     return _settings_has_model_type(settings) and _settings_media_kind_guess(settings) == target
@@ -1796,6 +1988,10 @@ def _settings_model_type(settings: dict[str, Any]) -> str:
     if not isinstance(settings, dict):
         return ""
     return str(settings.get("model_type") or "").strip()
+
+
+def _result_model_type(settings: dict[str, Any]) -> str:
+    return _short_text(_settings_model_type(settings), 50)
 
 
 def _model_accepts_image_refs(model_def: dict[str, Any]) -> bool:
