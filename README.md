@@ -5,7 +5,7 @@
 Connects Wan2GP to Filexa local generation so Telegram users can run local image and short video jobs on their own PC.
 The connector polls Filexa, submits tasks through Wan2GP's plugin API, reports progress, and returns supported results through the Filexa local connector API.
 
-Bot: https://t.me/WorkOnBigFilesBot
+Bot: https://t.me/FilexaAIBot
 
 Not affiliated with, endorsed by, or sponsored by Wan2GP.
 
@@ -26,7 +26,7 @@ Prebuilt packages are not required. Wan2GP loads this connector as a Python plug
 
 ## Install For A Wan2GP User
 
-The connector is designed to work with https://t.me/WorkOnBigFilesBot only.
+The connector is designed to work with https://t.me/FilexaAIBot only.
 
 1. Install Wan2GP from the official project:
    https://github.com/deepbeepmeep/Wan2GP

@@ -7,7 +7,7 @@ Filexa2Wan2GP Connector подключает Wan2GP к локальной ген
 Коннектор опрашивает Filexa, отправляет tasks через plugin API Wan2GP, сообщает progress и возвращает
 поддерживаемые results через Filexa local connector API.
 
-Бот: https://t.me/WorkOnBigFilesBot
+Бот: https://t.me/FilexaAIBot
 
 Не связан с Wan2GP, не одобрен и не спонсируется проектом Wan2GP.
 
@@ -36,7 +36,7 @@ Prebuilt packages не нужны. Wan2GP загружает этот конне
 
 ## Как установить для пользователя Wan2GP
 
-Коннектор рассчитан на работу только с https://t.me/WorkOnBigFilesBot.
+Коннектор рассчитан на работу только с https://t.me/FilexaAIBot.
 
 1. Установите Wan2GP из официального проекта:
    https://github.com/deepbeepmeep/Wan2GP
