@@ -27,7 +27,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 
 CONNECTOR_NAME = "Filexa2Wan2GP Connector"
-CONNECTOR_VERSION = "0.8.1"
+CONNECTOR_VERSION = "0.8.2"
 CONNECTOR_TAB_LABEL = "Filexa2Wan2GP"
 CONNECTOR_ID = "Filexa2Wan2GPConnector"
 FILEXA_BOT_URL = "https://t.me/FilexaAIBot"
