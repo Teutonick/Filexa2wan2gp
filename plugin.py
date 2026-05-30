@@ -27,7 +27,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 
 CONNECTOR_NAME = "Filexa2Wan2GP Connector"
-CONNECTOR_VERSION = "0.8.2"
+CONNECTOR_VERSION = "0.9.0"
 CONNECTOR_TAB_LABEL = "Filexa2Wan2GP"
 CONNECTOR_ID = "Filexa2Wan2GPConnector"
 FILEXA_BOT_URL = "https://t.me/FilexaAIBot"
@@ -91,7 +91,7 @@ SNAPSHOT_REFERENCE_PATH_KEYS = {
 
 @dataclass
 class FilexaConfig:
-    enabled: bool = False
+    enabled: bool = True
     api_url: str = ""
     token: str = ""
     keep_result_on_pc_only: bool = False
@@ -361,7 +361,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 "Connect this WanGP instance to Filexa local generation. All traffic is outbound "
                 f"from this PC to the configured [Filexa]({FILEXA_BOT_URL}) API URL.\n\n"
                 f"Plugin source: [Teutonick/Filexa2wan2gp]({PLUGIN_REPO_URL}).\n\n"
-                "- Set the Filexa API URL and token, enable the connector, then click Save / reconnect.\n"
+                "- Set the Filexa API URL and token, then click Save / reconnect.\n"
                 "- On the WanGP Video Generator tab, choose the model and generation settings; Filexa "
                 "task prompt/reference fields take priority.\n"
                 "- Keep WanGP running. The connector is ready to receive Filexa tasks."
@@ -543,9 +543,8 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
                 pass
         with self._config_lock:
             self._config.enabled = False
-            self._config.token = ""
             self._config.status = "disabled"
-            self._config.last_event = "Disconnected"
+            self._config.last_event = "Disconnected; saved token kept"
             self._config.last_error = ""
             self._clear_active_locked()
             self._save_config_locked()
@@ -1627,8 +1626,9 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
         config = self._config_snapshot()
         live_status, live_progress = self._live_progress_snapshot()
         active = bool(config.active_job_id)
-        label = "RUNNING" if active else ("ENABLED" if config.enabled else "DISABLED")
-        color = "#c5221f" if active else ("#188038" if config.enabled else "#5f6368")
+        ready = bool(config.enabled and config.api_url and config.token)
+        label = "RUNNING" if active else ("ENABLED" if ready else ("CONFIGURE" if config.enabled else "DISABLED"))
+        color = "#c5221f" if active else ("#188038" if ready else "#5f6368")
         progress_text = f" {live_progress}%" if active and live_progress is not None else ""
         job_text = f" job {config.active_job_id}" if active else ""
         stage = html.escape(live_status or config.last_event or "-")
@@ -1758,7 +1758,7 @@ class Filexa2Wan2GPConnectorPlugin(WAN2GPPlugin):
 
     def _network_fallback_notice(self) -> str:
         if self._active_upload_hint() or self._active_reference_hint():
-            return "⚠️ Unstable network, chunk transfer method temporarily enabled."
+            return "⚠️ Unstable network, chunk transfer method temporarily enabled. Large files will NOT be transferred! Search for them in the Wan2gp folder locally."
         return ""
 
     def _sleep_interruptible(self, seconds: float) -> None:

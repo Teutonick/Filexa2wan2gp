@@ -48,7 +48,8 @@ Prebuilt packages не нужны. Wan2GP загружает этот конне
 5. Настройте вкладку Wan2GP `Video Generator` с теми model/settings, которые должны использовать
    Filexa video jobs.
 6. В Filexa bot откройте local generation settings, выберите WanGP и скопируйте API URL и token.
-7. Вставьте API URL и token во вкладку коннектора, включите polling, затем нажмите `Save / reconnect`.
+7. Вставьте API URL и token во вкладку коннектора, затем нажмите `Save / reconnect`
+   (`Enable connector` включен по умолчанию).
 8. Дополнительно: включите `Manual settings snapshots` и обновляйте image/video snapshot кнопкой, когда
    хотите заморозить WanGP settings вместо automatic refresh перед каждой task.
 
@@ -93,6 +94,8 @@ methods показывать в bot UI.
 
 - Коннектор опрашивает Filexa каждые 10 секунд, пока включен.
 - Ему нужны Filexa API URL и bearer token, созданные bot.
+- `Disconnect` останавливает polling и локальную активность, но сохраняет token, пока вы
+  не замените его или не удалите local connector config вручную.
 - Если Filexa недоступна или token отклонен, коннектор сам переключается в disabled и прекращает
   polling. Исправьте URL/token/server, затем включите его вручную и нажмите `Save / reconnect`.
 - API URL должен указывать на тот же Filexa origin для всех task URLs, которые возвращает Filexa.
